@@ -45,9 +45,9 @@ No SDK yet. The contract comes first. Implementations will follow when a second 
 
 ## Status
 
-Spec-first. Initial profile: ZFS. No implementation in this repo.
+Spec-first. Initial profile: ZFS. Reference implementation at `examples/nq-zfs-witness` — Python, stdlib only, single file, drop-in.
 
-The first ZFS witness implementation may live as a helper script on the monitored host (see `profiles/zfs.md` for the required fields). A Python or Rust library emerges later if multiple witness profiles need shared scaffolding.
+`examples/nq-zfs-witness` is intentionally a clarify-pass implementation, not a production deployment: the scar register in `OPEN_ISSUES.md` and NQ project memory tracks what first-contact against a real pool surfaced. A Rust harden pass comes later, once a second profile exists to force shared scaffolding.
 
 ## License
 

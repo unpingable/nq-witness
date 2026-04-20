@@ -17,52 +17,62 @@ with a link to the commit or spec version that resolved them.
 
 ---
 
-## 1. `collection_mode` enum is missing the unprivileged-subprocess case
+## 2. `zfs_vdev` profile fields vs coverage-tag granularity
 
-**Severity:** structural — the MVP reference witness is currently *fabricating* a value.
+**Severity:** profile-design — coverage tags are coarser than per-observation
+field requirements, so a witness can declare honest coverage and still omit
+required fields inside an observation without tripping any contract check.
 
-**Location:** `SPEC.md` §Section requirements 2 (witness). The enum is
-`{embedded, exporter, textfile, sudo_helper}`. None of these fit a helper that
-runs as an ordinary user via subprocess invocation (no sudo, no long-running
-daemon, no file drop).
+**Location:** `profiles/zfs.md` §`zfs_vdev` required fields (`vdev_path`,
+`vdev_guid`, `vdev_type`) vs §Required coverage tags (`vdev_state`,
+`vdev_error_counters`). A witness can legitimately claim `vdev_state` coverage
+while omitting `vdev_path` / `vdev_guid` / `vdev_type` — those require `zdb`
+(root-only on most distros) or udev-path resolution the helper may not do.
 
-**Forcing case:** `lil-nas-x` (2026-04-17) has `/dev/zfs` at permissions `0666`,
-so the reference ZFS witness at `examples/nq-zfs-witness` can run as the
-unprivileged `claude` user — no sudoers entry needed. This is a legitimate
-deployment shape; `/dev/zfs` permissions are a distribution / kernel-configuration
-decision, and an unprivileged witness there is the principled option
-(strictly less privilege than a `sudo_helper`).
+**Forcing case:** the reference ZFS witness on lil-nas-x emits `zfs_vdev`
+observations without `vdev_guid`, `vdev_path`, or `vdev_type`, yet its
+coverage declarations are honest. Nothing in the contract catches the gap.
 
-**Current lie:** the MVP witness emits `collection_mode: "sudo_helper"` with
-`privilege_model: "unprivileged"`. `sudo_helper` specifically means
-"invokable via `sudo NOPASSWD`" per its spec definition. The MVP does not use
-sudo. The two fields disagreeing is the tell.
+**Why not fixed yet:** three plausible resolutions; the right one depends on
+what NQ detectors actually key by once the collector lands.
 
-**Why not fixed yet:** the fix is small (one new enum value) but it is an
-enum-level spec change, not an MVP fix. It should be made deliberately in the
-Python "clarify" pass of the witness implementation (per the
-`exist → clarify → harden` progression) so that other first-contact scars can
-be annealed in the same commit rather than in isolation.
+**Proposed resolution options:**
 
-**Proposed resolution:** add `subprocess` as a fifth value to the enum, defined
-as "one-shot invocation without privilege elevation — caller spawns the
-witness, witness emits a report and exits. Contrasts with `sudo_helper` which
-is specifically sudo-mediated." Orthogonal to `privilege_model`, which already
-captures the privilege dimension independently.
+1. Split required-field sets into finer coverage tags (`vdev_identity` tag
+   covers guid/path/type; `vdev_state` covers state; `vdev_error_counters`
+   covers counters). Finer-grained, more moving parts.
+2. Accept nullable required fields and add a profile-level conformance test
+   that reports which required fields are populated per observation.
+3. Keep the profile coarse but require a sidecar field on the observation
+   declaring "partial observation; fields X, Y, Z absent."
 
-**Anti-social-normalization reminder:** every cycle the MVP runs on lil-nas-x,
-its emitted report contains the `sudo_helper` lie. That output is the constant
-reminder that this is not resolved. Do not add a workaround in the consumer
-that papers over the mismatch; the consumer's behavior in the presence of
-mismatched `collection_mode` / `privilege_model` should be to log a warning,
-not to infer around it.
+**How to apply:** revisit once the NQ-side ZFS collector exists and real
+detectors exercise the observations. If detectors key by `subject` and
+`pool` without caring about `vdev_guid` / `vdev_path`, option 2 is fine.
+If detectors need GUIDs for cross-generation identity, option 1 is forced.
 
-**Tracking:** referenced from
-- `notquery/docs/gaps/ZFS_COLLECTOR_GAP.md` §Detectors (scar-tissue note)
-- NQ project memory: `project_zfs_witness_mvp_scars.md` (scar #1)
+**Tracking:** referenced from NQ project memory
+`project_zfs_witness_mvp_scars.md` (scar #2).
 
 ---
 
 ## RESOLVED
 
-*(empty — no resolved entries yet)*
+### 1. `collection_mode` enum missing the unprivileged-subprocess case
+
+**Resolved in:** clarify-pass commit adding `subprocess` to the
+`collection_mode` enum in `SPEC.md` §Section requirements 2.
+
+**Resolution:** the enum now reads
+`{embedded, exporter, textfile, subprocess, sudo_helper}`. `subprocess` is
+defined as "one-shot invocation without privilege elevation — caller spawns
+the witness, witness emits a report and exits." Distinct from `sudo_helper`,
+which is specifically sudo-mediated invocation. Orthogonal to
+`privilege_model`, which captures the privilege dimension independently.
+
+The reference ZFS witness at `examples/nq-zfs-witness` now emits
+`collection_mode: "subprocess"` + `privilege_model: "unprivileged"` by
+default on deployments where `/dev/zfs` permissions allow unprivileged
+reads (the lil-nas-x case that forced this fix). Deployments using a
+sudo-NOPASSWD wrapper emit the previous `sudo_helper` + `nopasswd_fixed_helper`
+pair, triggered via `NQ_COLLECTION_MODE` / `NQ_PRIVILEGE_MODEL` env vars.

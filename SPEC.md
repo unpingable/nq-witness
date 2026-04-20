@@ -105,7 +105,7 @@ Identity and collection metadata.
 | `type` | Short domain name (e.g. `zfs`, `sqlite`, `desktop_process`). Maps to a profile. |
 | `host` | **Runner / emitter identity.** The host on which the witness process is executing and emitting the report. This is provenance about the witness itself, not about what it observes. |
 | `profile_version` | Profile schema version (e.g. `nq.witness.zfs.v0`). |
-| `collection_mode` | How the witness gathers data: `embedded`, `exporter`, `textfile`, `sudo_helper`. |
+| `collection_mode` | How the witness gathers data: `embedded`, `exporter`, `textfile`, `subprocess`, `sudo_helper`. `subprocess` is a one-shot invocation without privilege elevation (caller spawns the witness, witness emits a report and exits). `sudo_helper` is specifically sudo-mediated invocation (`sudo NOPASSWD` of a fixed helper path). The two are distinguished by privilege_model, which is orthogonal. |
 | `privilege_model` | How privilege is structured: `unprivileged`, `root_exporter_localhost`, `nopasswd_fixed_helper`, `capability_bounded`. |
 | `collected_at` | ISO-8601 UTC timestamp of the collection cycle start. |
 | `duration_ms` | Collection cycle duration in milliseconds. |

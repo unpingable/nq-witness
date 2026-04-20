@@ -1,441 +1,709 @@
-#!/usr/bin/env bash
-# nq-zfs-witness — MVP reference implementation of a ZFS witness
-# conforming to nq.witness.v0 / nq.witness.zfs.v0.
+#!/usr/bin/env python3
+# nq-zfs-witness — reference ZFS witness conforming to
+# nq.witness.v0 / nq.witness.zfs.v0.
 #
-# Status: experimental / scar-tissue pass. Not production code.
-# Deployment: install root-owned at a fixed path (e.g.
-# /usr/local/libexec/nq-zfs-witness), grant sudo NOPASSWD for that
-# exact path, OR — if /dev/zfs permissions allow non-root read —
-# run it directly as the NQ user.
+# Status: clarify pass (bash → Python). Not production code.
+# Deployment: runs as an unprivileged subprocess when /dev/zfs
+# permissions allow non-root reads (the default shape). A sudo-
+# NOPASSWD wrapper may set NQ_COLLECTION_MODE=sudo_helper and
+# NQ_PRIVILEGE_MODEL=nopasswd_fixed_helper before exec.
 #
-# Invocation: no arguments, ever. Reads pool state, emits the
-# canonical JSON report to stdout, exits 0 on ok/partial and 1 only
-# on helper-level failure where no meaningful report can be emitted.
-#
-# Scars captured on first contact (2026-04-17, lil-nas-x):
-# - The SPEC's collection_mode enum ({embedded, exporter, textfile,
-#   sudo_helper}) has no value for "unprivileged one-shot subprocess"
-#   — which is exactly the legitimate shape this helper uses when
-#   /dev/zfs is world-readable. We emit "sudo_helper" here as the
-#   closest existing fit; the real shape is sudo-less subprocess
-#   invocation. Fix in a follow-up SPEC pass after clarify/harden.
-# - lil-nas-x pool "tank" has no configured spares despite earlier
-#   gap notes claiming "two spares assigned." The physical spares
-#   exist on the shelf but aren't in the pool config. No zfs_spare
-#   observations from this helper on that deployment; zpool_spare
-#   tag will be honest about that.
+# Invocation: no arguments in production. Emits the canonical JSON
+# report to stdout, exits 0. --zpool-list-from / --zpool-status-from
+# flags exist for fixture-driven testing only.
 
-set -euo pipefail
+from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
-readonly SCHEMA="nq.witness.v0"
-readonly PROFILE_VERSION="nq.witness.zfs.v0"
-readonly WITNESS_TYPE="zfs"
-readonly MAX_POOLS=16
-readonly MAX_VDEVS_PER_POOL=256
+SCHEMA = "nq.witness.v0"
+PROFILE_VERSION = "nq.witness.zfs.v0"
+WITNESS_TYPE = "zfs"
+MAX_POOLS = 16
+MAX_VDEVS_PER_POOL = 256
+COLLECTION_TIMEOUT_S = 5
 
-# ---------------------------------------------------------------------------
-# Identity + timing
-# ---------------------------------------------------------------------------
-
-start_ns=$(date +%s%N)
-collected_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-host=$(hostname)
-id="zfs.local.${host}"
-
-# ---------------------------------------------------------------------------
-# State carried across the run
-# ---------------------------------------------------------------------------
-
-errors_json='[]'
-observations_json='[]'
-status="ok"
-
-# Coverage is declared empty and tags are added as each collection step
-# succeeds. Anything never added falls out as missing — the profile's
-# conformance check should reject that, which is exactly the point:
-# silent omission is the failure mode we want visible.
-can_testify='[]'
-# Tags the helper structurally does not emit (future profile extensions
-# live here). Never sourced from this MVP implementation.
-cannot_testify='["smart_drive_health","enclosure_slot_mapping","dataset_capacity","dataset_properties"]'
-
-append_error() {
-  local kind="$1" detail="$2"
-  errors_json=$(jq -c --arg k "$kind" --arg d "$detail" \
-    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '. + [{kind:$k, detail:$d, observed_at:$ts}]' <<< "$errors_json")
+HEALTH_NUMERIC = {
+    "ONLINE": 0,
+    "DEGRADED": 3,
+    "FAULTED": 6,
+    "SUSPENDED": 9,
+    "OFFLINE": 4,
+    "UNAVAIL": 5,
+    "REMOVED": 8,
 }
 
-append_observation() {
-  # One argument: already-serialized JSON object.
-  local obs="$1"
-  observations_json=$(jq -c --argjson o "$obs" '. + [$o]' <<< "$observations_json")
-}
+GROUP_PREFIXES = (
+    "raidz", "mirror", "log-", "cache-", "special-", "dedup-",
+)
 
-add_coverage_tag() {
-  local tag="$1"
-  can_testify=$(jq -c --arg t "$tag" 'if index($t) then . else . + [$t] end' <<< "$can_testify")
-}
+SCAN_PATTERNS = [
+    # "scrub repaired 0B in 04:12:17 with 0 errors on Sun Apr 12 07:26:33 2026"
+    # "scrub repaired 123K in 0 days 04:12:17 with 0 errors on ..."
+    re.compile(
+        r"^scrub repaired \S+ in (?:[\d\s]+days? )?[\d:]+ with (\d+) errors on "
+        r"(?P<ts>[A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d+ [\d:]+ \d{4})$"
+    ),
+    # "resilvered 123M in 04:12:17 with 0 errors on ..."
+    re.compile(
+        r"^resilvered \S+ in (?:[\d\s]+days? )?[\d:]+ with (\d+) errors on "
+        r"(?P<ts>[A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d+ [\d:]+ \d{4})$"
+    ),
+    # "scrub in progress since Mon Apr 12 07:26:33 2026"
+    re.compile(
+        r"^(?P<type>scrub|resilver) in progress since "
+        r"(?P<ts>[A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d+ [\d:]+ \d{4})$"
+    ),
+    # "scrub canceled on Thu Dec 25 20:14:37 2025"
+    re.compile(
+        r"^(?P<type>scrub|resilver) canceled on "
+        r"(?P<ts>[A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d+ [\d:]+ \d{4})$"
+    ),
+    # "none requested"
+    re.compile(r"^none requested$"),
+]
 
-demote_to_cannot_testify() {
-  local tag="$1"
-  can_testify=$(jq -c --arg t "$tag" 'map(select(. != $t))' <<< "$can_testify")
-  cannot_testify=$(jq -c --arg t "$tag" 'if index($t) then . else . + [$t] end' <<< "$cannot_testify")
-}
 
-# ---------------------------------------------------------------------------
-# Pool list (zfs_pool observations)
-# ---------------------------------------------------------------------------
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-pool_list_raw=""
-if ! pool_list_raw=$(timeout 5 zpool list -Hp -o name,size,alloc,free,frag,cap,health,readonly 2>&1); then
-  append_error "zpool_list_failed" "zpool list returned non-zero"
-  status="failed"
-else
-  add_coverage_tag "pool_state"
-  add_coverage_tag "pool_capacity"
-  add_coverage_tag "fragmentation"
 
-  pool_names=()
-  while IFS=$'\t' read -r name size alloc free frag cap health readonly_flag; do
-    [[ -z "$name" ]] && continue
-    pool_names+=("$name")
+def parse_zpool_list(text: str) -> list[dict]:
+    """Parse `zpool list -Hp -o name,size,alloc,free,frag,cap,health,readonly`.
 
-    # Health string maps to a small integer for sparse-exporter compat.
-    # 0 ONLINE / 3 DEGRADED / 6 FAULTED / 9 SUSPENDED / other -> -1.
-    case "$health" in
-      ONLINE) health_numeric=0;;
-      DEGRADED) health_numeric=3;;
-      FAULTED) health_numeric=6;;
-      SUSPENDED) health_numeric=9;;
-      OFFLINE) health_numeric=4;;
-      UNAVAIL) health_numeric=5;;
-      REMOVED) health_numeric=8;;
-      *) health_numeric=-1;;
-    esac
+    Returns one dict per pool with normalized fields. Raises ValueError on
+    a line that does not have the expected 8 tab-separated fields.
+    """
+    pools: list[dict] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) != 8:
+            raise ValueError(
+                f"zpool list line {lineno}: expected 8 fields, got {len(parts)}"
+            )
+        name, size, alloc, free, frag, _cap, health, readonly_flag = parts
+        frag_ratio: float | None
+        if frag in ("-", ""):
+            frag_ratio = None
+        else:
+            frag_ratio = round(int(frag) / 100, 4)
+        pools.append({
+            "name": name,
+            "size_bytes": int(size),
+            "alloc_bytes": int(alloc),
+            "free_bytes": int(free),
+            "fragmentation_ratio": frag_ratio,
+            "state": health,
+            "health_numeric": HEALTH_NUMERIC.get(health, -1),
+            "readonly": readonly_flag == "on",
+        })
+    return pools
 
-    # zpool list -p emits frag as an integer percentage, or "-" when
-    # undefined. Convert to 0.0-1.0 or null.
-    if [[ "$frag" == "-" || -z "$frag" ]]; then
-      frag_ratio="null"
-    else
-      frag_ratio=$(awk -v f="$frag" 'BEGIN{printf "%.4f", f/100}')
-    fi
 
-    readonly_bool="false"
-    [[ "$readonly_flag" == "on" ]] && readonly_bool="true"
+def parse_scan_line(scan_line: str) -> tuple[dict, str | None]:
+    """Parse a `scan:` line into structured fields.
 
-    obs=$(jq -n -c \
-      --arg subject "$name" \
-      --arg state "$health" \
-      --argjson health_numeric "$health_numeric" \
-      --argjson size "$size" \
-      --argjson alloc "$alloc" \
-      --argjson free "$free" \
-      --argjson readonly "$readonly_bool" \
-      --argjson frag "$frag_ratio" \
-      '{kind:"zfs_pool", subject:$subject, state:$state, health_numeric:$health_numeric, size_bytes:$size, alloc_bytes:$alloc, free_bytes:$free, readonly:$readonly, fragmentation_ratio:$frag}'
+    Returns (fields, error_detail). On match fields are populated; on
+    parse failure error_detail is a non-empty string and fields carries
+    scan_state=None so the caller can demote coverage honestly.
+    """
+    fields = {
+        "scan_type": "none",
+        "scan_state": "none",
+        "last_completed_at": None,
+        "errors_found": 0,
+    }
+    s = scan_line.strip()
+    for pat in SCAN_PATTERNS:
+        m = pat.match(s)
+        if not m:
+            continue
+        gd = m.groupdict()
+        if s.startswith("scrub repaired"):
+            fields["scan_type"] = "scrub"
+            fields["scan_state"] = "completed"
+            fields["errors_found"] = int(m.group(1))
+            fields["last_completed_at"] = _rfc_to_iso(gd["ts"])
+        elif s.startswith("resilvered"):
+            fields["scan_type"] = "resilver"
+            fields["scan_state"] = "completed"
+            fields["errors_found"] = int(m.group(1))
+            fields["last_completed_at"] = _rfc_to_iso(gd["ts"])
+        elif "in progress" in s:
+            fields["scan_type"] = gd["type"]
+            fields["scan_state"] = "in_progress"
+        elif "canceled" in s:
+            fields["scan_type"] = gd["type"]
+            fields["scan_state"] = "canceled"
+        # "none requested" leaves defaults.
+        return fields, None
+    return (
+        {"scan_type": None, "scan_state": None,
+         "last_completed_at": None, "errors_found": None},
+        f"unrecognized scan line: {s!r}",
     )
-    append_observation "$obs"
-  done <<< "$pool_list_raw"
 
-  # Bound output per MAX_POOLS for safety (SPEC §Failure behavior rule 3).
-  if (( ${#pool_names[@]} > MAX_POOLS )); then
-    append_error "pool_count_exceeded_cap" "found ${#pool_names[@]} pools, cap is $MAX_POOLS; truncating"
-    status="partial"
-    pool_names=("${pool_names[@]:0:$MAX_POOLS}")
-  fi
-fi
 
-# ---------------------------------------------------------------------------
-# zpool status (per-vdev state, scan, spares)
-# ---------------------------------------------------------------------------
+def _rfc_to_iso(rfc: str) -> str | None:
+    for fmt in ("%a %b %d %H:%M:%S %Y", "%a %b  %d %H:%M:%S %Y"):
+        try:
+            dt = datetime.strptime(rfc, fmt).replace(tzinfo=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+    return None
 
-status_raw=""
-if ! status_raw=$(timeout 5 zpool status -P 2>&1); then
-  append_error "zpool_status_failed" "zpool status returned non-zero or timed out"
-  # Coverage for vdev / scan / spare tags is not added — which is the correct
-  # shape: absence of tag = absence of coverage.
-  status="partial"
-else
-  add_coverage_tag "vdev_state"
-  add_coverage_tag "vdev_error_counters"
-  add_coverage_tag "scrub_state"
-  add_coverage_tag "scrub_completion"
-  add_coverage_tag "spare_state"
 
-  # Parse with awk. State machine:
-  # - track current_pool from "pool:" lines
-  # - on "scan:" capture the scan line (one per pool)
-  # - between "config:" and the next blank-followed-by-errors, collect vdevs
-  # - a "spares" line inside config switches us to spares mode
-  vdev_count=0
-  parsed=$(awk -v mvp_max="$MAX_VDEVS_PER_POOL" '
-    BEGIN {
-      current_pool = ""
-      in_config = 0
-      in_spares = 0
-      scan_idx = 0
-      vdev_idx = 0
-      spare_idx = 0
-      pool_errors_idx = 0
-    }
-    /^[[:space:]]*pool:[[:space:]]/ {
-      split($0, a, "pool:")
-      current_pool = a[2]
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", current_pool)
-      in_config = 0
-      in_spares = 0
-      next
-    }
-    /^[[:space:]]*scan:[[:space:]]/ {
-      split($0, a, "scan:")
-      scan_line = a[2]
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", scan_line)
-      printf("SCAN\t%s\t%s\n", current_pool, scan_line)
-      next
-    }
-    /^config:/ {
-      in_config = 1
-      in_spares = 0
-      next
-    }
-    /^errors:/ {
-      in_config = 0
-      in_spares = 0
-      split($0, a, "errors:")
-      err_line = a[2]
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", err_line)
-      printf("POOL_ERRORS\t%s\t%s\n", current_pool, err_line)
-      next
-    }
-    in_config == 1 {
-      # Skip blank lines and the NAME STATE READ WRITE CKSUM header.
-      if ($0 ~ /^[[:space:]]*$/) { in_spares = 0; next }
-      if ($0 ~ /^[[:space:]]+NAME[[:space:]]+STATE/) { next }
-      # The "spares" pseudo-header line.
-      if ($1 == "spares") { in_spares = 1; next }
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip())
 
-      # Leaf detection: a leaf has at least 5 fields and its second
-      # field is a state string (ONLINE/DEGRADED/FAULTED/etc).
-      # Non-leaf lines (pool itself, raidz groups) have the same
-      # shape but their name matches the pool or a vdev_type prefix.
-      name = $1
-      state = $2
-      read_err = $3
-      write_err = $4
-      cksum_err = $5
-      note = ""
-      if (NF > 5) {
-        note = $6
-        for (i = 7; i <= NF; i++) note = note " " $i
-      }
 
-      # Skip pool-level and group-level rows. Leaves are what the profile
-      # calls for — device-level observations. We skip anything whose
-      # name matches a known non-leaf pattern.
-      if (name == current_pool) next
-      if (name ~ /^raidz[0-9]*-/ || name ~ /^mirror-/ || name ~ /^spare-/ || name ~ /^log-/ || name ~ /^cache-/ || name ~ /^special-/ || name ~ /^dedup-/) {
-        next
-      }
+def _is_group_name(name: str) -> bool:
+    # raidz-0, raidz2-0, mirror-0, log-0, cache-0, special-0, dedup-0.
+    return any(name.startswith(p) for p in GROUP_PREFIXES)
 
-      if (in_spares == 1) {
-        # Spare-section entries: "ata-FOO-BAR  AVAIL" or
-        # "ata-FOO-BAR  INUSE  currently in use"
-        # State is in $2; no error counters; note in $3+.
-        spare_state = $2
-        spare_note = ""
-        if (NF > 2) {
-          spare_note = $3
-          for (i = 4; i <= NF; i++) spare_note = spare_note " " $i
-        }
-        if (spare_idx < mvp_max) {
-          printf("SPARE\t%s\t%s\t%s\t%s\n", current_pool, name, spare_state, spare_note)
-          spare_idx++
-        }
-      } else {
-        if (vdev_idx < mvp_max) {
-          printf("VDEV\t%s\t%s\t%s\t%d\t%d\t%d\t%s\n", current_pool, name, state, read_err, write_err, cksum_err, note)
-          vdev_idx++
-        }
-      }
-    }
-  ' <<< "$status_raw")
 
-  # Process parsed lines into observations.
-  while IFS=$'\t' read -r tag rest; do
-    [[ -z "$tag" ]] && continue
-    case "$tag" in
-      SCAN)
-        IFS=$'\t' read -r pool scan_line <<< "$rest"
+def _is_spare_wrapper(name: str) -> bool:
+    # spare-0, spare-1 etc. — the compound "spare replacing X" vdev.
+    return re.match(r"^spare-\d+$", name) is not None
 
-        # "scrub repaired 0B in 04:12:17 with 0 errors on Sun Apr 12 07:26:33 2026"
-        # "scrub canceled on Thu Dec 25 20:14:37 2025"
-        # "resilver in progress since Mon Mar  1 ..."
-        # "none requested"
-        scan_type="none"
-        scan_state="none"
-        last_completed="null"
-        errors_found=0
 
-        if [[ "$scan_line" == scrub* ]]; then
-          scan_type="scrub"
-        elif [[ "$scan_line" == resilver* ]]; then
-          scan_type="resilver"
-        fi
-        if [[ "$scan_line" == *"in progress"* ]]; then
-          scan_state="in_progress"
-        elif [[ "$scan_line" == *canceled* ]]; then
-          scan_state="canceled"
-        elif [[ "$scan_line" == *completed* || "$scan_line" == *"with "*"errors on"* || "$scan_line" == *repaired* ]]; then
-          scan_state="completed"
-        fi
-        # Completion timestamp: extract the " on <Day Mon DD HH:MM:SS YYYY>" tail
-        # and try to normalize. If we can't parse, leave null.
-        if [[ "$scan_line" =~ \ on\ ([A-Z][a-z]{2}\ [A-Z][a-z]{2}\ +[0-9]+\ [0-9:]+\ [0-9]{4})$ ]]; then
-          ts_raw="${BASH_REMATCH[1]}"
-          if iso_ts=$(date -u -d "$ts_raw" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null); then
-            last_completed="\"$iso_ts\""
-          fi
-        fi
-        # Errors: "with N errors"
-        if [[ "$scan_line" =~ with\ ([0-9]+)\ errors ]]; then
-          errors_found="${BASH_REMATCH[1]}"
-        fi
+def parse_zpool_status(text: str) -> dict:
+    """Parse `zpool status -P` into pools → {scans, vdevs, spares, pool_errors}.
 
-        obs=$(jq -n -c \
-          --arg subject "$pool" \
-          --arg pool "$pool" \
-          --arg scan_type "$scan_type" \
-          --arg scan_state "$scan_state" \
-          --argjson last_completed "$last_completed" \
-          --argjson errors_found "$errors_found" \
-          '{kind:"zfs_scan", subject:$subject, pool:$pool, scan_type:$scan_type, scan_state:$scan_state, last_completed_at:$last_completed, errors_found:$errors_found}'
+    Returns a dict keyed by pool name. Each value has:
+      scans: list of (raw_scan_line, scan_line_errors|None)
+      vdevs: list of leaf device rows with parent-group context
+      spares: list of spare-section rows
+      pool_errors_raw: the raw `errors:` line text
+    """
+    out: dict[str, dict] = {}
+    current_pool: str | None = None
+    section: str | None = None  # "config" | "spares" | None
+    # Stack of (indent, name) tracking the current config-tree ancestry.
+    stack: list[tuple[int, str]] = []
+    # Track whether we're currently inside a spare-N wrapper — its
+    # leaf children are marked is_replacing and the spare-named one
+    # is_spare. Reset when indent returns to the wrapper's depth or shallower.
+    spare_wrapper_indent: int | None = None
+
+    lines = text.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            # Blank line resets spare-wrapper tracking.
+            spare_wrapper_indent = None
+            continue
+
+        # Top-level directive lines (pool:, scan:, config:, errors:, status:, action:, see:).
+        m = re.match(r"^\s*pool:\s+(.+)$", line)
+        if m:
+            current_pool = m.group(1).strip()
+            out.setdefault(current_pool, {
+                "scans": [], "vdevs": [], "spares": [],
+                "pool_errors_raw": None,
+            })
+            section = None
+            stack = []
+            spare_wrapper_indent = None
+            continue
+        m = re.match(r"^\s*scan:\s+(.+)$", line)
+        if m and current_pool:
+            fields, err = parse_scan_line(m.group(1))
+            out[current_pool]["scans"].append((fields, err))
+            continue
+        if re.match(r"^config:\s*$", line):
+            section = "config"
+            stack = []
+            spare_wrapper_indent = None
+            continue
+        m = re.match(r"^\s*errors:\s+(.+)$", line)
+        if m and current_pool:
+            out[current_pool]["pool_errors_raw"] = m.group(1).strip()
+            section = None
+            continue
+        # Skip other directive lines we don't structurally use.
+        if re.match(r"^\s*(status|action|see):", line):
+            continue
+
+        if section != "config" or current_pool is None:
+            continue
+
+        # Inside config. Skip the NAME STATE READ WRITE CKSUM header.
+        if re.match(r"^\s+NAME\s+STATE\s+READ\s+WRITE\s+CKSUM", line):
+            continue
+
+        indent = _indent_of(line)
+        parts = stripped.split()
+
+        # The "spares" pseudo-header line switches to spares section.
+        if len(parts) == 1 and parts[0] == "spares":
+            section = "spares-header"
+            stack = []
+            spare_wrapper_indent = None
+            continue
+
+        # We've left config proper if we hit non-config content.
+        # Everything after this is a row with at least a name.
+        name = parts[0]
+
+        # Unwind stack to current indent.
+        while stack and stack[-1][0] >= indent:
+            popped_indent, popped_name = stack.pop()
+            if spare_wrapper_indent is not None and popped_indent <= spare_wrapper_indent:
+                spare_wrapper_indent = None
+
+        # Pool-level row (name == current_pool) — skip; it's not a vdev.
+        if name == current_pool:
+            stack.append((indent, name))
+            continue
+
+        # Group row (raidz-0 / mirror-0 / log-0 / cache-0 / special-0 / dedup-0):
+        # remember on the stack and move on.
+        if _is_group_name(name):
+            stack.append((indent, name))
+            continue
+
+        # Spare wrapper (spare-0, spare-1 ...): mark descendants as replacing.
+        if _is_spare_wrapper(name):
+            spare_wrapper_indent = indent
+            stack.append((indent, name))
+            continue
+
+        # Leaf device row.
+        if len(parts) < 5:
+            # Malformed line: skip, track via a return-level error? For now
+            # we just drop it — the pool state from zpool list still stands.
+            continue
+        state = parts[1]
+        try:
+            read_err = int(parts[2])
+            write_err = int(parts[3])
+            cksum_err = int(parts[4])
+        except ValueError:
+            continue
+        note = " ".join(parts[5:]) if len(parts) > 5 else ""
+
+        # Find nearest group ancestor on the stack (raidz/mirror/etc.).
+        parent_group = None
+        for _ind, _nm in reversed(stack):
+            if _is_group_name(_nm):
+                parent_group = _nm
+                break
+
+        # Strip /dev/disk/by-id/ prefix and -partN suffix from device name.
+        short = name.rsplit("/", 1)[-1]
+        short = re.sub(r"-part\d+$", "", short)
+
+        if parent_group:
+            subject = f"{current_pool}/{parent_group}/{short}"
+        else:
+            subject = f"{current_pool}/{short}"
+
+        is_replacing = spare_wrapper_indent is not None and indent > spare_wrapper_indent
+        is_spare = is_replacing and short.startswith(("ata-", "scsi-", "wwn-")) and (
+            "SPARE" in short.upper() or "spare" in short
         )
-        append_observation "$obs"
-        ;;
-      VDEV)
-        IFS=$'\t' read -r pool name state read_err write_err cksum_err note <<< "$rest"
-        # zpool status -P emits vdev names as absolute paths
-        # (/dev/disk/by-id/wwn-... or /dev/sdX). Strip the prefix and
-        # any -partN suffix so subject is a readable identifier.
-        short_name="${name##*/}"
-        short_name="${short_name%-part[0-9]*}"
-        subject="${pool}/${short_name}"
-        # MVP does not resolve vdev_path / vdev_guid / vdev_type; those
-        # require additional tooling (zdb, udev paths). Report what we have.
-        note_json="null"
-        if [[ -n "$note" ]]; then
-          note_json=$(jq -Rn --arg n "$note" '$n')
-        fi
-        obs=$(jq -n -c \
-          --arg subject "$subject" \
-          --arg pool "$pool" \
-          --arg name "$name" \
-          --arg state "$state" \
-          --argjson read "$read_err" \
-          --argjson write "$write_err" \
-          --argjson cksum "$cksum_err" \
-          --argjson note "$note_json" \
-          '{kind:"zfs_vdev", subject:$subject, pool:$pool, vdev_name:$name, state:$state, read_errors:$read, write_errors:$write, checksum_errors:$cksum, status_note:$note, is_spare:false, is_replacing:false}'
+
+        out[current_pool]["vdevs"].append({
+            "subject": subject,
+            "pool": current_pool,
+            "vdev_name": name,
+            "state": state,
+            "read_errors": read_err,
+            "write_errors": write_err,
+            "checksum_errors": cksum_err,
+            "status_note": note or None,
+            "is_spare": is_spare,
+            "is_replacing": is_replacing,
+        })
+        stack.append((indent, name))
+
+    # After the config block the "spares" section is parsed on its own.
+    # Re-scan to pick up spare-section rows. This is separate from vdev
+    # parsing because the columns differ ("ata-X AVAIL" vs vdev columns).
+    _parse_spares_section(lines, out)
+
+    return out
+
+
+def _parse_spares_section(lines: list[str], out: dict[str, dict]) -> None:
+    """Second-pass: walk through 'spares' sections and collect spare rows."""
+    current_pool: str | None = None
+    in_spares = False
+    for line in lines:
+        m = re.match(r"^\s*pool:\s+(.+)$", line)
+        if m:
+            current_pool = m.group(1).strip()
+            in_spares = False
+            continue
+        if re.match(r"^config:\s*$", line):
+            in_spares = False
+            continue
+        if re.match(r"^\s*errors:", line):
+            in_spares = False
+            continue
+        if line.strip() == "spares":
+            in_spares = True
+            continue
+        if not in_spares or current_pool is None:
+            continue
+        stripped = line.strip()
+        if not stripped:
+            in_spares = False
+            continue
+        parts = stripped.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0]
+        state = parts[1]
+        note = " ".join(parts[2:]) if len(parts) > 2 else ""
+        out.setdefault(current_pool, {
+            "scans": [], "vdevs": [], "spares": [],
+            "pool_errors_raw": None,
+        })
+        out[current_pool]["spares"].append({
+            "name": name,
+            "state": state,
+            "note": note,
+        })
+
+
+def build_report(
+    host: str,
+    pool_rows: list[dict] | None,
+    pool_rows_error: str | None,
+    status_by_pool: dict[str, dict] | None,
+    status_error: str | None,
+    start_ns: int,
+    collected_at: str,
+    collection_mode: str,
+    privilege_model: str,
+) -> dict:
+    errors: list[dict] = []
+    can_testify: list[str] = []
+    # Seed with the profile-required tags (§Required coverage.can_testify
+    # tags) plus tags this implementation structurally does not source.
+    # Successful collection steps move tags out of this list into
+    # can_testify via add_tag; unsourced tags stay here, which is the
+    # SPEC §Coverage "honest rule" — silence equals admission is the
+    # failure mode this list prevents.
+    cannot_testify: list[str] = [
+        "pool_state",
+        "pool_capacity",
+        "vdev_state",
+        "vdev_error_counters",
+        "scrub_state",
+        "scrub_completion",
+        "spare_state",
+        "smart_drive_health",
+        "enclosure_slot_mapping",
+        "dataset_capacity",
+        "dataset_properties",
+    ]
+    observations: list[dict] = []
+    status = "ok"
+
+    def add_error(kind: str, detail: str) -> None:
+        errors.append({
+            "kind": kind,
+            "detail": detail,
+            "observed_at": utc_now_iso(),
+        })
+
+    def add_tag(tag: str) -> None:
+        if tag not in can_testify:
+            can_testify.append(tag)
+        if tag in cannot_testify:
+            cannot_testify.remove(tag)
+
+    def demote_tag(tag: str) -> None:
+        if tag in can_testify:
+            can_testify.remove(tag)
+        if tag not in cannot_testify:
+            cannot_testify.append(tag)
+
+    # zpool list → zfs_pool observations.
+    if pool_rows is None:
+        add_error("zpool_list_failed", pool_rows_error or "unknown failure")
+        status = "failed"
+    else:
+        add_tag("pool_state")
+        add_tag("pool_capacity")
+        add_tag("fragmentation")
+        add_tag("readonly_flag")
+        if len(pool_rows) > MAX_POOLS:
+            add_error(
+                "pool_count_exceeded_cap",
+                f"found {len(pool_rows)} pools, cap is {MAX_POOLS}; truncating",
+            )
+            status = "partial"
+            pool_rows = pool_rows[:MAX_POOLS]
+        for p in pool_rows:
+            observations.append({
+                "kind": "zfs_pool",
+                "subject": p["name"],
+                "state": p["state"],
+                "health_numeric": p["health_numeric"],
+                "size_bytes": p["size_bytes"],
+                "alloc_bytes": p["alloc_bytes"],
+                "free_bytes": p["free_bytes"],
+                "readonly": p["readonly"],
+                "fragmentation_ratio": p["fragmentation_ratio"],
+            })
+
+    # zpool status → vdev / scan / spare observations + pool-error lines.
+    if status_by_pool is None:
+        add_error("zpool_status_failed", status_error or "unknown failure")
+        if status == "ok":
+            status = "partial"
+        # Do not add vdev/scan/spare tags; their absence is honest.
+    else:
+        add_tag("vdev_state")
+        add_tag("vdev_error_counters")
+        add_tag("scrub_state")
+        add_tag("scrub_completion")
+        add_tag("spare_state")
+
+        # Scan observations: emit only if the scan line parsed. Any parse
+        # failure demotes both scrub_state and scrub_completion for the
+        # whole cycle — we don't know the state or the timestamp, so per
+        # SPEC §Partial collection we can't emit half-observations either.
+        any_scan_unparsed = any(
+            err is not None
+            for data in status_by_pool.values()
+            for _fields, err in data["scans"]
         )
-        append_observation "$obs"
-        ;;
-      SPARE)
-        IFS=$'\t' read -r pool name spare_state spare_note <<< "$rest"
-        subject="${pool}/spare/${name}"
-        is_active="false"
-        [[ "$spare_state" == "INUSE" ]] && is_active="true"
-        obs=$(jq -n -c \
-          --arg subject "$subject" \
-          --arg pool "$pool" \
-          --arg name "$name" \
-          --arg state "$spare_state" \
-          --argjson is_active "$is_active" \
-          '{kind:"zfs_spare", subject:$subject, pool:$pool, spare_name:$name, state:$state, is_active:$is_active, replacing_vdev_guid:null}'
+        if any_scan_unparsed:
+            for data in status_by_pool.values():
+                for _fields, err in data["scans"]:
+                    if err is not None:
+                        add_error("scan_line_unparsed", err)
+            demote_tag("scrub_state")
+            demote_tag("scrub_completion")
+            if status == "ok":
+                status = "partial"
+        else:
+            for pool_name, data in status_by_pool.items():
+                for fields, _err in data["scans"]:
+                    observations.append({
+                        "kind": "zfs_scan",
+                        "subject": pool_name,
+                        "pool": pool_name,
+                        "scan_type": fields["scan_type"],
+                        "scan_state": fields["scan_state"],
+                        "last_completed_at": fields["last_completed_at"],
+                        "errors_found": fields["errors_found"],
+                    })
+
+        for pool_name, data in status_by_pool.items():
+
+            # Vdevs. Cap at MAX_VDEVS_PER_POOL.
+            vdevs = data["vdevs"][:MAX_VDEVS_PER_POOL]
+            if len(data["vdevs"]) > MAX_VDEVS_PER_POOL:
+                add_error(
+                    "vdev_count_exceeded_cap",
+                    f"pool {pool_name}: {len(data['vdevs'])} vdevs, cap is {MAX_VDEVS_PER_POOL}",
+                )
+                if status == "ok":
+                    status = "partial"
+            for v in vdevs:
+                observations.append({
+                    "kind": "zfs_vdev",
+                    "subject": v["subject"],
+                    "pool": v["pool"],
+                    "vdev_name": v["vdev_name"],
+                    "state": v["state"],
+                    "read_errors": v["read_errors"],
+                    "write_errors": v["write_errors"],
+                    "checksum_errors": v["checksum_errors"],
+                    "status_note": v["status_note"],
+                    "is_spare": v["is_spare"],
+                    "is_replacing": v["is_replacing"],
+                })
+
+            # Spares. This branch is untested against a deployment with real
+            # spares (lil-nas-x has none); the fixture exercises it abstractly.
+            for sp in data["spares"]:
+                is_active = sp["state"] == "INUSE"
+                observations.append({
+                    "kind": "zfs_spare",
+                    "subject": f"{pool_name}/spare/{sp['name']}",
+                    "pool": pool_name,
+                    "spare_name": sp["name"],
+                    "state": sp["state"],
+                    "is_active": is_active,
+                    "replacing_vdev_guid": None,
+                })
+
+            # Pool-level errors. Structured check for the stable "clean" string;
+            # anything else surfaces as a pool_data_errors entry in errors[].
+            err_line = data["pool_errors_raw"]
+            if err_line is not None and err_line != "No known data errors":
+                add_error("pool_data_errors", f"pool {pool_name}: {err_line}")
+
+    # Build standing from current can_testify.
+    authoritative: list[str] = []
+    if "pool_state" in can_testify:
+        authoritative.append("current_pool_state")
+    if "vdev_state" in can_testify:
+        authoritative.append("current_vdev_state")
+    if "vdev_error_counters" in can_testify:
+        authoritative.append("current_vdev_error_counts")
+    if "scrub_completion" in can_testify:
+        authoritative.append("last_scrub_completion")
+    if "spare_state" in can_testify:
+        authoritative.append("spare_assignment")
+
+    advisory = (
+        ["chronic_vs_worsening_regime_classification"]
+        if "vdev_error_counters" in can_testify
+        else []
+    )
+    inadmissible = ["drive_smart_health", "authorization", "remediation"]
+
+    duration_ms = (time.monotonic_ns() - start_ns) // 1_000_000
+
+    return {
+        "schema": SCHEMA,
+        "witness": {
+            "id": f"zfs.local.{host}",
+            "type": WITNESS_TYPE,
+            "host": host,
+            "profile_version": PROFILE_VERSION,
+            "collection_mode": collection_mode,
+            "privilege_model": privilege_model,
+            "collected_at": collected_at,
+            "duration_ms": duration_ms,
+            "status": status,
+        },
+        "coverage": {
+            "can_testify": can_testify,
+            "cannot_testify": cannot_testify,
+        },
+        "standing": {
+            "authoritative_for": authoritative,
+            "advisory_for": advisory,
+            "inadmissible_for": inadmissible,
+        },
+        "observations": observations,
+        "errors": errors,
+    }
+
+
+def _run(cmd: list[str], timeout_s: int) -> tuple[str | None, str | None]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
         )
-        append_observation "$obs"
-        ;;
-      POOL_ERRORS)
-        IFS=$'\t' read -r pool err_line <<< "$rest"
-        if [[ "$err_line" != "No known data errors" ]]; then
-          append_error "pool_data_errors" "pool ${pool}: ${err_line}"
-        fi
-        ;;
-    esac
-  done <<< "$parsed"
-fi
+    except subprocess.TimeoutExpired:
+        return None, f"{cmd[0]} timed out after {timeout_s}s"
+    except FileNotFoundError:
+        return None, f"{cmd[0]} not found on PATH"
+    if proc.returncode != 0:
+        return None, (
+            f"{cmd[0]} exited {proc.returncode}: {proc.stderr.strip()[:200]}"
+        )
+    return proc.stdout, None
 
-# ---------------------------------------------------------------------------
-# Build standing — derived from can_testify.
-# ---------------------------------------------------------------------------
 
-authoritative_for='[]'
-if jq -e 'index("pool_state")' <<< "$can_testify" >/dev/null; then
-  authoritative_for=$(jq -c '. + ["current_pool_state"]' <<< "$authoritative_for")
-fi
-if jq -e 'index("vdev_state")' <<< "$can_testify" >/dev/null; then
-  authoritative_for=$(jq -c '. + ["current_vdev_state"]' <<< "$authoritative_for")
-fi
-if jq -e 'index("vdev_error_counters")' <<< "$can_testify" >/dev/null; then
-  authoritative_for=$(jq -c '. + ["current_vdev_error_counts"]' <<< "$authoritative_for")
-fi
-if jq -e 'index("scrub_completion")' <<< "$can_testify" >/dev/null; then
-  authoritative_for=$(jq -c '. + ["last_scrub_completion"]' <<< "$authoritative_for")
-fi
-if jq -e 'index("spare_state")' <<< "$can_testify" >/dev/null; then
-  authoritative_for=$(jq -c '. + ["spare_assignment"]' <<< "$authoritative_for")
-fi
+def detect_invocation_context() -> tuple[str, str]:
+    """Return (collection_mode, privilege_model) based on env / process uid.
 
-advisory_for='["chronic_vs_worsening_regime_classification"]'
-# Per SPEC §Partial collection, if vdev-level coverage is missing, the
-# advisory standing for regime classification must also be demoted.
-if ! jq -e 'index("vdev_error_counters")' <<< "$can_testify" >/dev/null; then
-  advisory_for='[]'
-fi
+    Defaults: subprocess + unprivileged. Overridable via env vars for
+    deployments that wrap this helper in a sudo-NOPASSWD invocation.
+    """
+    mode = os.environ.get("NQ_COLLECTION_MODE")
+    priv = os.environ.get("NQ_PRIVILEGE_MODEL")
+    if mode and priv:
+        return mode, priv
+    if os.environ.get("SUDO_UID"):
+        return "sudo_helper", "nopasswd_fixed_helper"
+    return "subprocess", "unprivileged"
 
-inadmissible_for='["drive_smart_health","authorization","remediation"]'
 
-# ---------------------------------------------------------------------------
-# Finalize + emit
-# ---------------------------------------------------------------------------
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--zpool-list-from", type=Path, default=None,
+                        help="Read zpool list output from file (for testing)")
+    parser.add_argument("--zpool-status-from", type=Path, default=None,
+                        help="Read zpool status output from file (for testing)")
+    parser.add_argument("--host", default=None,
+                        help="Override reported hostname (for testing)")
+    args = parser.parse_args(argv)
 
-end_ns=$(date +%s%N)
-duration_ms=$(( (end_ns - start_ns) / 1000000 ))
+    start_ns = time.monotonic_ns()
+    collected_at = utc_now_iso()
+    host = args.host or socket.gethostname()
+    collection_mode, privilege_model = detect_invocation_context()
 
-witness_obj=$(jq -n -c \
-  --arg id "$id" \
-  --arg type "$WITNESS_TYPE" \
-  --arg host "$host" \
-  --arg profile_version "$PROFILE_VERSION" \
-  --arg collected_at "$collected_at" \
-  --argjson duration_ms "$duration_ms" \
-  --arg status "$status" \
-  '{id:$id, type:$type, host:$host, profile_version:$profile_version, collection_mode:"sudo_helper", privilege_model:"unprivileged", collected_at:$collected_at, duration_ms:$duration_ms, status:$status}'
-)
+    # zpool list.
+    if args.zpool_list_from is not None:
+        pool_text = args.zpool_list_from.read_text()
+        list_err: str | None = None
+    else:
+        pool_text, list_err = _run(
+            ["zpool", "list", "-Hp", "-o",
+             "name,size,alloc,free,frag,cap,health,readonly"],
+            COLLECTION_TIMEOUT_S,
+        )
 
-coverage_obj=$(jq -n -c \
-  --argjson ct "$can_testify" \
-  --argjson nt "$cannot_testify" \
-  '{can_testify:$ct, cannot_testify:$nt}'
-)
+    pool_rows: list[dict] | None = None
+    if pool_text is not None:
+        try:
+            pool_rows = parse_zpool_list(pool_text)
+        except ValueError as e:
+            pool_rows = None
+            list_err = f"zpool list parse error: {e}"
 
-standing_obj=$(jq -n -c \
-  --argjson a "$authoritative_for" \
-  --argjson av "$advisory_for" \
-  --argjson i "$inadmissible_for" \
-  '{authoritative_for:$a, advisory_for:$av, inadmissible_for:$i}'
-)
+    # zpool status.
+    if args.zpool_status_from is not None:
+        status_text = args.zpool_status_from.read_text()
+        status_err: str | None = None
+    else:
+        status_text, status_err = _run(
+            ["zpool", "status", "-P"],
+            COLLECTION_TIMEOUT_S,
+        )
 
-jq -n \
-  --arg schema "$SCHEMA" \
-  --argjson witness "$witness_obj" \
-  --argjson coverage "$coverage_obj" \
-  --argjson standing "$standing_obj" \
-  --argjson observations "$observations_json" \
-  --argjson errors "$errors_json" \
-  '{schema:$schema, witness:$witness, coverage:$coverage, standing:$standing, observations:$observations, errors:$errors}'
+    status_by_pool: dict[str, dict] | None = None
+    if status_text is not None:
+        try:
+            status_by_pool = parse_zpool_status(status_text)
+        except Exception as e:
+            status_by_pool = None
+            status_err = f"zpool status parse error: {e}"
+
+    report = build_report(
+        host=host,
+        pool_rows=pool_rows,
+        pool_rows_error=list_err,
+        status_by_pool=status_by_pool,
+        status_error=status_err,
+        start_ns=start_ns,
+        collected_at=collected_at,
+        collection_mode=collection_mode,
+        privilege_model=privilege_model,
+    )
+    json.dump(report, sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
