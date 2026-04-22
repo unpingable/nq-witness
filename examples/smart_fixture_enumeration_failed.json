@@ -1,0 +1,39 @@
+{
+  "schema": "nq.witness.v0",
+  "witness": {
+    "id": "smart.local.missing-binary-host",
+    "type": "smart",
+    "host": "missing-binary-host",
+    "profile_version": "nq.witness.smart.v0",
+    "collection_mode": "subprocess",
+    "privilege_model": "unprivileged",
+    "collected_at": "2026-04-22T16:30:00Z",
+    "duration_ms": 4,
+    "status": "failed"
+  },
+  "coverage": {
+    "can_testify": [],
+    "cannot_testify": [
+      "device_enumeration"
+    ]
+  },
+  "standing": {
+    "authoritative_for": [],
+    "advisory_for": [],
+    "inadmissible_for": [
+      "drive_failure_prediction",
+      "replacement_authorization",
+      "vendor_rma_eligibility",
+      "authorization",
+      "remediation"
+    ]
+  },
+  "observations": [],
+  "errors": [
+    {
+      "kind": "scan_binary_missing",
+      "detail": "smartctl not found on PATH; witness cannot enumerate devices. Install smartmontools or point SMARTCTL_PATH at the binary.",
+      "observed_at": "2026-04-22T16:30:00Z"
+    }
+  ]
+}

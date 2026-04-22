@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+# nq-smart-witness — reference SMART witness conforming to
+# nq.witness.v0 / nq.witness.smart.v0.
+#
+# Phase 1: raw evidence only. No detectors, no verdicts, no cross-device
+# scoring. The witness answers "what did the device say?" — reconciling
+# contradictions (e.g. smart_status.passed=true with nonzero uncorrected
+# errors) is detector work and does not live here.
+#
+# Deployment: the canonical privilege path is a sudo-NOPASSWD wrapper
+# that exec's this script with NQ_COLLECTION_MODE=sudo_helper and
+# NQ_PRIVILEGE_MODEL=nopasswd_fixed_helper set. Running without that
+# wrapper is supported — per-device smartctl opens that fail emit
+# collection_outcome=permission_denied rather than omitting the device.
+#
+# Invocation: no arguments in production. Emits the canonical JSON
+# report to stdout, exits 0 even on partial/failed collection (exit
+# status is for executor failures, not collection failures).
+#
+# See profiles/smart.md for the contract.
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCHEMA = "nq.witness.v0"
+PROFILE_VERSION = "nq.witness.smart.v0"
+WITNESS_TYPE = "smart"
+
+# Bounds. Phase 1 witnesses run on-demand from the publisher cycle;
+# these caps protect against runaway enumeration on pathological hosts.
+MAX_DEVICES = 64
+SCAN_TIMEOUT_S = 5
+PER_DEVICE_TIMEOUT_S = 10
+RAW_MAX_BYTES = 32 * 1024
+
+# Known per-observation coverage tags. Centralized here (not stringly
+# scattered through the code) per the profile's "lock the coverage-tag
+# vocabulary early" discipline.
+TAG_DEVICE_IDENTITY = "device_identity"
+TAG_SMART_AVAILABILITY = "smart_availability"
+TAG_SMART_OVERALL_STATUS = "smart_overall_status"
+TAG_TEMPERATURE = "temperature"
+TAG_POWER_ON_HOURS = "power_on_hours"
+TAG_NVME_HEALTH_LOG = "nvme_health_log"
+TAG_SCSI_ERROR_COUNTERS = "scsi_error_counters"
+TAG_ATA_SMART_ATTRIBUTES = "ata_smart_attributes"
+TAG_RAW_FULL_FIDELITY = "raw_full_fidelity"
+
+ALL_DEVICE_TAGS = (
+    TAG_DEVICE_IDENTITY,
+    TAG_SMART_AVAILABILITY,
+    TAG_SMART_OVERALL_STATUS,
+    TAG_TEMPERATURE,
+    TAG_POWER_ON_HOURS,
+    TAG_NVME_HEALTH_LOG,
+    TAG_SCSI_ERROR_COUNTERS,
+    TAG_ATA_SMART_ATTRIBUTES,
+)
+
+# Class-applicable tag sets. A tag in the "applicable" set for a class
+# but absent from can_testify becomes cannot_testify — that's the
+# "class-applicable and successfully reachable" rule for outcome=ok.
+CLASS_APPLICABLE_TAGS = {
+    "nvme": {
+        TAG_DEVICE_IDENTITY, TAG_SMART_AVAILABILITY, TAG_SMART_OVERALL_STATUS,
+        TAG_TEMPERATURE, TAG_POWER_ON_HOURS, TAG_NVME_HEALTH_LOG,
+    },
+    "scsi": {
+        TAG_DEVICE_IDENTITY, TAG_SMART_AVAILABILITY, TAG_SMART_OVERALL_STATUS,
+        TAG_TEMPERATURE, TAG_POWER_ON_HOURS, TAG_SCSI_ERROR_COUNTERS,
+    },
+    "ata": {
+        TAG_DEVICE_IDENTITY, TAG_SMART_AVAILABILITY, TAG_SMART_OVERALL_STATUS,
+        TAG_TEMPERATURE, TAG_POWER_ON_HOURS, TAG_ATA_SMART_ATTRIBUTES,
+    },
+    "usb_bridge": {
+        TAG_DEVICE_IDENTITY, TAG_SMART_AVAILABILITY,
+    },
+    "unknown": {
+        TAG_DEVICE_IDENTITY, TAG_SMART_AVAILABILITY,
+    },
+}
+
+# Fields that MUST appear in every observation (as null when not populated).
+NORMALIZED_FIELDS_NULLABLE = (
+    "model", "serial_number", "firmware_version",
+    "capacity_bytes", "logical_block_size",
+    "smart_available", "smart_enabled", "smart_overall_passed",
+    "temperature_c", "power_on_hours",
+    "uncorrected_read_errors", "uncorrected_write_errors",
+    "uncorrected_verify_errors",
+    "media_errors",
+    "nvme_percentage_used", "nvme_available_spare_pct",
+    "nvme_critical_warning", "nvme_unsafe_shutdowns",
+)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run(cmd: list[str], timeout_s: int) -> tuple[str | None, str | None, int | None]:
+    """Run a subprocess. Returns (stdout, error_detail, exit_status).
+
+    Unlike the ZFS witness's _run, SMART treats nonzero exit as data,
+    not as a collection error — smartctl exits 2 on permission denied
+    but still emits structured JSON that says so. The caller classifies.
+    """
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"{cmd[0]} timed out after {timeout_s}s", None
+    except FileNotFoundError:
+        return None, f"{cmd[0]} not found on PATH", None
+    return proc.stdout, None, proc.returncode
+
+
+def detect_invocation_context() -> tuple[str, str]:
+    """Return (collection_mode, privilege_model). Same env-override
+    pattern as nq-zfs-witness."""
+    mode = os.environ.get("NQ_COLLECTION_MODE")
+    priv = os.environ.get("NQ_PRIVILEGE_MODEL")
+    if mode and priv:
+        return mode, priv
+    if os.environ.get("SUDO_UID"):
+        return "sudo_helper", "nopasswd_fixed_helper"
+    return "subprocess", "unprivileged"
+
+
+def classify_device_class(device_type: str | None, protocol: str | None) -> str:
+    """Map smartctl's device/protocol fields to the bounded class enum
+    defined in profiles/smart.md §Device class normalization."""
+    t = (device_type or "").lower()
+    p = (protocol or "").upper()
+    if "nvme" in t or p == "NVME":
+        return "nvme"
+    if t.startswith("usb"):
+        return "usb_bridge"
+    if t in ("sat", "scsi") or p == "SCSI":
+        return "scsi"
+    if t == "ata" or p == "ATA":
+        return "ata"
+    return "unknown"
+
+
+def compute_subject(sc: dict, device_path: str) -> tuple[str, bool]:
+    """Compute stable subject. Returns (subject, stable).
+
+    Priority: wwn (from SCSI logical_unit_id or ATA wwn) > serial > path.
+    Path subject implies stable=False per §Subject identity tier 3.
+    """
+    # SCSI case: logical_unit_id holds WWN
+    lun = sc.get("logical_unit_id")
+    if isinstance(lun, str) and lun.startswith("0x"):
+        return f"wwn:{lun.lower()}", True
+    # ATA case: wwn present as separate block with naa/oui/id triplet
+    wwn = sc.get("wwn")
+    if isinstance(wwn, dict):
+        naa = wwn.get("naa")
+        oui = wwn.get("oui")
+        wid = wwn.get("id")
+        if naa is not None and oui is not None and wid is not None:
+            return f"wwn:0x{naa:x}{oui:06x}{wid:09x}", True
+    # Serial fallback
+    serial = sc.get("serial_number")
+    if isinstance(serial, str) and serial.strip():
+        return f"serial:{serial.strip()}", True
+    # Tier 3: path — explicitly unstable
+    return f"path:{device_path}", False
+
+
+def extract_normalized(sc: dict, device_class: str) -> dict:
+    """Pull the normalized fields out of a smartctl -j -a payload.
+    Missing fields become None; nothing is invented."""
+    out: dict = {f: None for f in NORMALIZED_FIELDS_NULLABLE}
+
+    # Identity: model varies by class
+    out["model"] = (
+        sc.get("model_name")
+        or sc.get("scsi_model_name")
+        or _join_scsi_vendor_product(sc)
+    )
+    out["serial_number"] = sc.get("serial_number")
+    out["firmware_version"] = (
+        sc.get("firmware_version") or sc.get("scsi_revision")
+    )
+
+    # Capacity / block size
+    user_cap = sc.get("user_capacity")
+    if isinstance(user_cap, dict):
+        out["capacity_bytes"] = user_cap.get("bytes")
+    out["logical_block_size"] = sc.get("logical_block_size")
+
+    # SMART availability
+    ss = sc.get("smart_support")
+    if isinstance(ss, dict):
+        out["smart_available"] = ss.get("available")
+        out["smart_enabled"] = ss.get("enabled")
+
+    # SMART overall status — profile calls this advisory, but it's
+    # surfaced raw. null when absent, not false.
+    st = sc.get("smart_status")
+    if isinstance(st, dict) and "passed" in st:
+        out["smart_overall_passed"] = st.get("passed")
+
+    # Temperature
+    temp = sc.get("temperature")
+    if isinstance(temp, dict) and "current" in temp:
+        out["temperature_c"] = temp.get("current")
+
+    # Power-on hours
+    pot = sc.get("power_on_time")
+    if isinstance(pot, dict) and "hours" in pot:
+        out["power_on_hours"] = pot.get("hours")
+
+    # Class-specific fields
+    if device_class == "nvme":
+        nhl = sc.get("nvme_smart_health_information_log")
+        if isinstance(nhl, dict):
+            out["media_errors"] = nhl.get("media_errors")
+            out["nvme_percentage_used"] = nhl.get("percentage_used")
+            out["nvme_available_spare_pct"] = nhl.get("available_spare")
+            out["nvme_critical_warning"] = nhl.get("critical_warning")
+            out["nvme_unsafe_shutdowns"] = nhl.get("unsafe_shutdowns")
+    elif device_class == "scsi":
+        ecl = sc.get("scsi_error_counter_log")
+        if isinstance(ecl, dict):
+            for direction, key in (
+                ("read", "uncorrected_read_errors"),
+                ("write", "uncorrected_write_errors"),
+                ("verify", "uncorrected_verify_errors"),
+            ):
+                block = ecl.get(direction)
+                if isinstance(block, dict):
+                    out[key] = block.get("total_uncorrected_errors")
+
+    return out
+
+
+def _join_scsi_vendor_product(sc: dict) -> str | None:
+    v = sc.get("scsi_vendor")
+    p = sc.get("scsi_product")
+    if v and p:
+        return f"{v} {p}".strip()
+    return None
+
+
+def determine_coverage(sc: dict, device_class: str, normalized: dict) -> tuple[list[str], list[str]]:
+    """Classify which tags this observation can and cannot testify about.
+
+    A tag lands in can_testify only if the underlying evidence was
+    actually read. Every class-applicable tag that isn't in can_testify
+    goes in cannot_testify; non-applicable tags also go in cannot_testify
+    (the profile's explicit-rather-than-silent discipline)."""
+    can: list[str] = []
+
+    # Identity: need at least model OR serial OR wwn
+    if normalized["model"] or normalized["serial_number"]:
+        can.append(TAG_DEVICE_IDENTITY)
+
+    # Availability: need both smart_support.available and .enabled read
+    if normalized["smart_available"] is not None and normalized["smart_enabled"] is not None:
+        can.append(TAG_SMART_AVAILABILITY)
+
+    # Overall status
+    if normalized["smart_overall_passed"] is not None:
+        can.append(TAG_SMART_OVERALL_STATUS)
+
+    # Temperature
+    if normalized["temperature_c"] is not None:
+        can.append(TAG_TEMPERATURE)
+
+    # Power-on hours
+    if normalized["power_on_hours"] is not None:
+        can.append(TAG_POWER_ON_HOURS)
+
+    # Class-specific data blocks
+    if device_class == "nvme" and isinstance(sc.get("nvme_smart_health_information_log"), dict):
+        can.append(TAG_NVME_HEALTH_LOG)
+    if device_class == "scsi" and isinstance(sc.get("scsi_error_counter_log"), dict):
+        can.append(TAG_SCSI_ERROR_COUNTERS)
+    if device_class == "ata" and isinstance(sc.get("ata_smart_attributes"), dict):
+        can.append(TAG_ATA_SMART_ATTRIBUTES)
+
+    cannot = [t for t in ALL_DEVICE_TAGS if t not in can]
+    return can, cannot
+
+
+def extract_raw(sc: dict) -> tuple[dict, bool, int | None, int | None]:
+    """Strip the outer smartctl envelope from a -j -a payload, keep
+    the device body. Truncate to RAW_MAX_BYTES if needed, preserving
+    the high-value subtrees.
+
+    Returns (raw, truncated, original_bytes, truncated_bytes)."""
+    envelope_keys = {"json_format_version", "smartctl", "local_time"}
+    raw: dict = {k: v for k, v in sc.items() if k not in envelope_keys}
+
+    serialized = json.dumps(raw, separators=(",", ":"))
+    original_bytes = len(serialized.encode("utf-8"))
+    if original_bytes <= RAW_MAX_BYTES:
+        return raw, False, original_bytes, None
+
+    # Preserve high-value subtrees; drop everything else.
+    keep = {
+        "smart_status",
+        "smart_support",
+        "nvme_smart_health_information_log",
+        "nvme_error_information_log",
+        "scsi_error_counter_log",
+        "scsi_grown_defect_list",
+        "ata_smart_attributes",
+        "ata_smart_error_log",
+        "ata_smart_self_test_log",
+        "temperature",
+        "power_on_time",
+        "power_cycle_count",
+        "model_name", "scsi_model_name",
+        "serial_number",
+        "user_capacity",
+        "device",
+    }
+    trimmed = {k: v for k, v in raw.items() if k in keep}
+    trimmed_serialized = json.dumps(trimmed, separators=(",", ":"))
+    trimmed_bytes = len(trimmed_serialized.encode("utf-8"))
+    return trimmed, True, original_bytes, trimmed_bytes
+
+
+def classify_outcome(
+    exit_status: int | None,
+    sc: dict | None,
+    normalized: dict | None,
+    device_class: str,
+    subject_stable: bool,
+) -> str:
+    """Pick collection_outcome per §collection_outcome.
+
+    Priority: permission_denied > unsupported > partial > ok.
+    """
+    # smartctl couldn't even run
+    if sc is None:
+        return "error"
+    # smartctl emitted error messages indicating permission problem
+    messages = (sc.get("smartctl") or {}).get("messages") if isinstance(sc.get("smartctl"), dict) else None
+    if messages:
+        for m in messages:
+            if isinstance(m, dict) and m.get("severity") == "error":
+                text = (m.get("string") or "").lower()
+                if "permission denied" in text:
+                    return "permission_denied"
+    if exit_status is not None and exit_status != 0 and exit_status != 4:
+        # smartctl uses exit 2 for open failures. 4 is informational
+        # (some SMART attributes in prefail but device not failed).
+        # Distinguish permission from other errors via the messages
+        # check above; anything else is error.
+        if normalized is None or normalized.get("smart_available") is None:
+            return "error"
+    # SMART explicitly unavailable
+    if normalized is not None and normalized.get("smart_available") is False:
+        return "unsupported"
+    # Fell back to path subject
+    if not subject_stable:
+        return "partial"
+    # ok requires all class-applicable tags in can_testify.
+    # classify_coverage already enforces cannot_testify completeness;
+    # we just check that nothing class-applicable fell through.
+    if normalized is None:
+        return "error"
+    # Success path — caller verifies coverage separately.
+    return "ok"
+
+
+def build_observation(sc: dict | None, device_path: str, device_type: str | None,
+                       device_protocol: str | None, exit_status: int | None,
+                       run_error: str | None) -> dict:
+    """Assemble one smart_device observation from a smartctl -j -a payload
+    (or from its failure)."""
+    device_class = classify_device_class(device_type, device_protocol)
+
+    # Hard-fail path: smartctl couldn't run at all for this device.
+    if sc is None:
+        return _minimal_observation(
+            device_path=device_path,
+            device_class=device_class,
+            device_protocol=device_protocol,
+            outcome="error",
+            subject=f"path:{device_path}",
+            raw={"run_error": run_error} if run_error else {},
+        )
+
+    normalized = extract_normalized(sc, device_class)
+    subject, stable = compute_subject(sc, device_path)
+    can, cannot = determine_coverage(sc, device_class, normalized)
+
+    # Outcome classification happens before coverage bookkeeping so we
+    # can factor in subject stability.
+    outcome = classify_outcome(exit_status, sc, normalized, device_class, stable)
+
+    # Partial implies device_identity might be in cannot_testify — the
+    # classify_outcome above has already set outcome=partial for that case.
+    if not stable and TAG_DEVICE_IDENTITY in can:
+        # Subject fell back to path but we DID read identity fields.
+        # Keep identity in can_testify; partial reflects subject
+        # instability, not identity absence. (Possible on pathological
+        # drives that report model/serial but no WWN.)
+        pass
+
+    # Raw payload with truncation bookkeeping
+    raw, truncated, orig_bytes, trunc_bytes = extract_raw(sc)
+    if truncated and TAG_RAW_FULL_FIDELITY not in cannot:
+        cannot.append(TAG_RAW_FULL_FIDELITY)
+
+    obs = {
+        "kind": "smart_device",
+        "subject": subject,
+        "device_path": device_path,
+        "device_class": device_class,
+        "protocol": device_protocol or "",
+    }
+    obs.update(normalized)
+    obs["coverage"] = {"can_testify": can, "cannot_testify": cannot}
+    obs["collection_outcome"] = outcome
+    obs["raw"] = raw
+    if truncated:
+        obs["raw_truncated"] = True
+        obs["raw_original_bytes"] = orig_bytes
+        obs["raw_truncated_bytes"] = trunc_bytes
+
+    return obs
+
+
+def _minimal_observation(device_path: str, device_class: str,
+                           device_protocol: str | None, outcome: str,
+                           subject: str, raw: dict) -> dict:
+    """Fallback observation for devices we could not open at all.
+    Still appears in observations[] per the profile's anti-omission rules."""
+    obs: dict = {
+        "kind": "smart_device",
+        "subject": subject,
+        "device_path": device_path,
+        "device_class": device_class,
+        "protocol": device_protocol or "",
+    }
+    for f in NORMALIZED_FIELDS_NULLABLE:
+        obs[f] = None
+    obs["coverage"] = {
+        "can_testify": [],
+        "cannot_testify": list(ALL_DEVICE_TAGS),
+    }
+    obs["collection_outcome"] = outcome
+    obs["raw"] = raw
+    return obs
+
+
+def build_report(
+    host: str,
+    scan_payload: dict | None,
+    scan_error: str | None,
+    per_device: list[tuple[str, str | None, str | None, dict | None, int | None, str | None]],
+    start_ns: int,
+    collected_at: str,
+    collection_mode: str,
+    privilege_model: str,
+) -> dict:
+    """Assemble the canonical witness report.
+
+    per_device: list of (device_path, device_type, device_protocol,
+                         smartctl_payload, exit_status, run_error) tuples.
+    """
+    errors: list[dict] = []
+    observations: list[dict] = []
+
+    # Enumeration went wrong — no devices to observe.
+    if scan_payload is None:
+        status = "failed"
+        coverage_can: list[str] = []
+        coverage_cannot = ["device_enumeration"]
+        if scan_error:
+            errors.append({
+                "kind": _classify_scan_error(scan_error),
+                "detail": scan_error,
+                "observed_at": collected_at,
+            })
+    else:
+        status = "ok"
+        coverage_can = ["device_enumeration"]
+        coverage_cannot = []
+        for path, dtype, dproto, payload, exit_status, run_err in per_device[:MAX_DEVICES]:
+            obs = build_observation(payload, path, dtype, dproto, exit_status, run_err)
+            observations.append(obs)
+            # Per-device non-ok outcomes demote witness status to partial
+            # per the enumeration-behavior table.
+            if obs["collection_outcome"] in ("permission_denied", "error", "timeout"):
+                status = "partial"
+                errors.append({
+                    "kind": f"device_{obs['collection_outcome']}",
+                    "detail": f"{path}: {run_err or obs['collection_outcome']}",
+                    "observed_at": collected_at,
+                })
+
+    duration_ms = max(0, (time.monotonic_ns() - start_ns) // 1_000_000)
+
+    return {
+        "schema": SCHEMA,
+        "witness": {
+            "id": f"smart.local.{host}",
+            "type": WITNESS_TYPE,
+            "host": host,
+            "profile_version": PROFILE_VERSION,
+            "collection_mode": collection_mode,
+            "privilege_model": privilege_model,
+            "collected_at": collected_at,
+            "duration_ms": duration_ms,
+            "status": status,
+        },
+        "coverage": {
+            "can_testify": coverage_can,
+            "cannot_testify": coverage_cannot,
+        },
+        "standing": {
+            "authoritative_for": [
+                "smart_reported_uncorrected_error_counts",
+                "smart_reported_power_on_hours",
+                "smart_reported_temperature",
+            ],
+            "advisory_for": [
+                "drive_health_overall",
+            ],
+            "inadmissible_for": [
+                "drive_failure_prediction",
+                "replacement_authorization",
+                "vendor_rma_eligibility",
+                "authorization",
+                "remediation",
+            ],
+        },
+        "observations": observations,
+        "errors": errors,
+    }
+
+
+def _classify_scan_error(detail: str) -> str:
+    d = detail.lower()
+    if "not found" in d:
+        return "scan_binary_missing"
+    if "timed out" in d or "timeout" in d:
+        return "scan_timeout"
+    if "permission" in d:
+        return "scan_insufficient_privilege"
+    return "scan_failed"
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--smartctl-path", default="smartctl",
+                        help="Path to smartctl (default: %(default)s)")
+    parser.add_argument("--host", default=None,
+                        help="Override reported hostname (for testing)")
+    parser.add_argument("--scan-from", type=Path, default=None,
+                        help="Read scan JSON from file (for testing)")
+    parser.add_argument("--device-json-dir", type=Path, default=None,
+                        help="Directory of per-device JSONs (for testing). "
+                             "Names match basename of device_path.")
+    args = parser.parse_args(argv)
+
+    start_ns = time.monotonic_ns()
+    collected_at = utc_now_iso()
+    host = args.host or socket.gethostname()
+    collection_mode, privilege_model = detect_invocation_context()
+
+    # Enumerate devices.
+    if args.scan_from is not None:
+        try:
+            scan_payload = json.loads(args.scan_from.read_text())
+            scan_error: str | None = None
+        except (OSError, json.JSONDecodeError) as e:
+            scan_payload = None
+            scan_error = f"fixture scan read failed: {e}"
+    else:
+        scan_out, scan_error, _ = _run(
+            [args.smartctl_path, "-j", "--scan"],
+            SCAN_TIMEOUT_S,
+        )
+        scan_payload = None
+        if scan_out is not None:
+            try:
+                scan_payload = json.loads(scan_out)
+            except json.JSONDecodeError as e:
+                scan_error = f"smartctl --scan parse error: {e}"
+
+    per_device: list[tuple[str, str | None, str | None, dict | None, int | None, str | None]] = []
+    if scan_payload is not None:
+        devices = scan_payload.get("devices") or []
+        for dev in devices[:MAX_DEVICES]:
+            path = dev.get("name")
+            dtype = dev.get("type")
+            dproto = dev.get("protocol")
+            if not path:
+                continue
+            payload, run_err, exit_status = _fetch_device(
+                args, path, dtype,
+            )
+            per_device.append((path, dtype, dproto, payload, exit_status, run_err))
+
+    report = build_report(
+        host=host,
+        scan_payload=scan_payload,
+        scan_error=scan_error,
+        per_device=per_device,
+        start_ns=start_ns,
+        collected_at=collected_at,
+        collection_mode=collection_mode,
+        privilege_model=privilege_model,
+    )
+    json.dump(report, sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0
+
+
+def _fetch_device(args, path: str, dtype: str | None) -> tuple[dict | None, str | None, int | None]:
+    """Read per-device payload either from fixture dir or live smartctl."""
+    if args.device_json_dir is not None:
+        name = os.path.basename(path)
+        candidate = args.device_json_dir / f"{name}.json"
+        if not candidate.exists():
+            return None, f"fixture for {name} not found", None
+        try:
+            return json.loads(candidate.read_text()), None, 0
+        except (OSError, json.JSONDecodeError) as e:
+            return None, f"fixture read failed: {e}", None
+
+    cmd = [args.smartctl_path, "-j", "-a"]
+    if dtype:
+        cmd.extend(["-d", dtype])
+    cmd.append(path)
+    out, err, exit_status = _run(cmd, PER_DEVICE_TIMEOUT_S)
+    if out is None:
+        return None, err, exit_status
+    try:
+        return json.loads(out), None, exit_status
+    except json.JSONDecodeError as e:
+        return None, f"smartctl -a parse error for {path}: {e}", exit_status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
