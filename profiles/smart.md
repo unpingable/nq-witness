@@ -82,6 +82,7 @@ One observation per device discovered by `smartctl --scan` or equivalent. Requir
   "nvme_available_spare_pct": null,
   "nvme_critical_warning": null,
   "nvme_unsafe_shutdowns": null,
+  "reallocated_sector_count": null,
   "coverage": {
     "can_testify": [
       "device_identity",
@@ -244,5 +245,7 @@ Default standing block for a SMART witness:
 
 - No detector logic. No `smart_predictive_failure`, no `smart_udma_errors_rising`, no `smart_temperature_high`. These arrive in Phase 2, after the raw substrate has been in production long enough to tune against real data.
 - No cross-device aggregation. Phase 1 emits per-device observations; any host-level or array-level rollup is a consumer concern.
-- No normalization of ATA vendor attributes into a common schema. ATA attribute IDs mean different things across vendors (e.g. attribute 5 — reallocated sectors — is common, but attribute 190 temperature has three different encodings across SSD vendors). The witness surfaces the raw attribute table; consumers and future detectors can normalize the subset they care about.
+- No general normalization of ATA vendor attributes into a common schema. ATA attribute IDs mean different things across vendors (e.g. attribute 190 temperature has three different encodings across SSD vendors). The witness surfaces the raw attribute table; consumers and future detectors can normalize the subset they care about.
+
+  **Carve-out: attribute 5 (Reallocated_Sector_Ct).** The cross-vendor consensus on attribute 5 is universal — the raw value is the count of reallocated sectors. The witness extracts this one attribute as a normalized field (`reallocated_sector_count`) so detectors can use it without parsing per-vendor attribute tables. Other attributes remain unnormalized. Adding more carve-outs requires the same level of cross-vendor consensus.
 - No smartd notifications, no active scanning beyond `smartctl -a`, no self-test scheduling, no mutation of device state.
