@@ -56,6 +56,82 @@ If detectors need GUIDs for cross-generation identity, option 1 is forced.
 
 ---
 
+## 3. First-class witness position
+
+**Severity:** latent schema pressure — canonical reports identify `witness.type`
+and profile but do not declare witness position explicitly. Position is currently
+derivable from type because every shipped witness occupies the same position
+(substrate). This stops being sufficient the moment a non-substrate witness
+exists or NQ needs to correlate testimony across positions.
+
+**Location:** `SPEC.md` §Section requirements 2 (`witness` block fields). No
+field today carries the position dimension. `witness.type` carries domain
+(`zfs`, `device_health`, etc.) but conflates "what the witness observes" with
+"what register it observes from."
+
+**Forcing case:** none yet. NQ-side doctrine (`docs/SCOPE_AND_WITNESS_MODEL.md`
+in the notquery repo, codified 2026-04-28) names five witness positions:
+`substrate`, `application_internal`, `application_external`, `platform_internal`,
+`platform_external`. Existing shipped witnesses (ZFS, SMART) are all
+`substrate`. The doctrine bites when: (a) the first non-substrate witness
+profile is proposed (e.g. an HTTP-probe witness = `application_external`, a
+systemd-unit witness = `platform_internal`), or (b) NQ needs to render or
+correlate disagreement across witness positions for the same subject.
+
+**Why not fixed yet:** today the field would be 100% derivable from
+`witness.type` for every conforming witness. Requiring it now is schema theater
+— consumers cannot use it because there is no cross-position case to consume.
+Filing the debt avoids the alternative failure mode where the first
+non-substrate witness ships and downstream reverse-engineers position from
+type, locking in a local convention rather than a canonical declaration.
+
+**Proposed resolution options:**
+
+1. Add `witness.position` as a required field in the next schema version.
+   Profiles enumerate valid positions for the domain (most profiles will
+   declare exactly one). Schema bump (`v0` → `v1`) and consumer migration.
+2. Add `witness.position` as an optional field in `v0` with a profile-level
+   "MUST be declared starting from profile vN" rule. Lets adoption happen
+   per-profile without a generic schema bump.
+3. Defer entirely until a second position appears in the wild. Risks the
+   reverse-engineer-from-type failure mode above; the upside is no schema
+   churn for a field with one possible value.
+
+**Constitutional line (applies under all three options):**
+
+> Witness position is not authority. It locates testimony; it does not license
+> action.
+
+This prevents the later failure mode where some position (typically
+`application_external`) gets treated as schema-level "higher truth" rather than
+as a witness location whose evidentiary weight is dispute-specific.
+
+**Candidate JSON shape (illustrative, not normative):**
+
+```json
+{
+  "witness": {
+    "id": "smart.local.lil-nas-x",
+    "type": "device_health",
+    "position": "substrate",
+    "profile_version": "nq.witness.smart.v0"
+  }
+}
+```
+
+**How to apply:** revisit when the first non-substrate witness profile is
+proposed (forces option 1 or 2) or when NQ-side detector code needs to read
+`witness.position` to render cross-position disagreement (also forces option 1
+or 2). Until then, `witness.type` carrying position implicitly is acceptable
+local convention but should not be relied on as canonical testimony.
+
+**Tracking:** referenced from NQ project memory `project_scope_axes.md`
+(pointer to `notquery/docs/SCOPE_AND_WITNESS_MODEL.md`). Doctrine pinned
+2026-04-28; spec change deliberately deferred per "doctrine now, schema on
+forcing case" pattern.
+
+---
+
 ## RESOLVED
 
 ### 1. `collection_mode` enum missing the unprivileged-subprocess case
