@@ -270,12 +270,13 @@ This spec defines the generic contract. Concrete profiles live in `profiles/*.md
 Currently shipped:
 
 - `profiles/zfs.md` — ZFS pools, vdevs, scrubs, spares
+- `profiles/smart.md` — drive-level SMART health complementing ZFS
+- `profiles/fs_inode.md` — per-mount inode usage with explicit scope declaration
 
 Future (not yet written):
 
 - Desktop process / memory pressure profile — supports DESKTOP_FORENSICS_GAP in NQ
 - SQLite / WAL witness profile — detects external-DB-reader pinning
-- SMART profile — drive-level health complementing ZFS
 
 ## Source conformance tiers
 
