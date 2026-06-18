@@ -121,8 +121,8 @@ Each family stays as a candidate-named member of this gap until its forcing case
 
 ## References
 
-- NQ: [`docs/gaps/DURABLE_ARTIFACT_SUBSTRATE_GAP.md`](../../../notquery/docs/gaps/DURABLE_ARTIFACT_SUBSTRATE_GAP.md) — substrate-class admission this gap is a producer-family for; see §"Remote / online corpora are in scope" for the upstream scope note.
-- NQ: [`docs/CONSUMER_DRYRUN.md`](../../../notquery/docs/CONSUMER_DRYRUN.md) — consumer-side handoff pattern that mirrors this producer-side filing; same hardened-seam discipline.
+- NQ: [`docs/gaps/DURABLE_ARTIFACT_SUBSTRATE_GAP.md`](../../../nq/docs/gaps/DURABLE_ARTIFACT_SUBSTRATE_GAP.md) — substrate-class admission this gap is a producer-family for; see §"Remote / online corpora are in scope" for the upstream scope note.
+- NQ: [`docs/CONSUMER_DRYRUN.md`](../../../nq/docs/CONSUMER_DRYRUN.md) — consumer-side handoff pattern that mirrors this producer-side filing; same hardened-seam discipline.
 - nq-witness: `SPEC.md` — constitutional sentence ("backend integration may supply observations, only a conforming witness may supply testimony") is the discipline this gap extends.
 - nq-witness: [`docs/gaps/LIBRARY_NATIVE_WITNESS_GAP.md`](LIBRARY_NATIVE_WITNESS_GAP.md) — sibling producer-side construction-discipline filing (typed mint, shared validator). Composes: a future remote-substrate witness implementation would use the library-native mint pattern to construct conforming reports.
 - Doctrine framing 2026-05-12 (James + chatty conversation, NQ-side): *bad velocity collapses boundaries to reduce friction; good velocity hardens boundaries so crossing them becomes cheap.* This gap is the producer-family-side hardening for remote substrates.

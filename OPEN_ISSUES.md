@@ -70,7 +70,7 @@ field today carries the position dimension. `witness.type` carries domain
 "what register it observes from."
 
 **Forcing case:** none yet. NQ-side doctrine (`docs/SCOPE_AND_WITNESS_MODEL.md`
-in the notquery repo, codified 2026-04-28) names five witness positions:
+in the nq repo, codified 2026-04-28) names five witness positions:
 `substrate`, `application_internal`, `application_external`, `platform_internal`,
 `platform_external`. Existing shipped witnesses (ZFS, SMART) are all
 `substrate`. The doctrine bites when: (a) the first non-substrate witness
@@ -126,7 +126,7 @@ or 2). Until then, `witness.type` carrying position implicitly is acceptable
 local convention but should not be relied on as canonical testimony.
 
 **Tracking:** referenced from NQ project memory `project_scope_axes.md`
-(pointer to `notquery/docs/SCOPE_AND_WITNESS_MODEL.md`). Doctrine pinned
+(pointer to `nq/docs/SCOPE_AND_WITNESS_MODEL.md`). Doctrine pinned
 2026-04-28; spec change deliberately deferred per "doctrine now, schema on
 forcing case" pattern.
 

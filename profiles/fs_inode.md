@@ -386,4 +386,4 @@ A baseline Prometheus exporter exposing `node_filesystem_files` / `node_filesyst
 
 ## Coverage audit cross-reference
 
-This profile closes the `fs_inode` row of the NQ coverage audit (`notquery/docs/coverage/traditional-monitoring-coverage-audit.md`). The forcing case for naming this row was the traditional-monitoring observation that inode exhaustion is a distinct failure axis from byte capacity — a canonical "boring obvious" omission in monitoring stacks that conflate "disk is full" with "filesystem is full."
+This profile closes the `fs_inode` row of the NQ coverage audit (`nq/docs/coverage/traditional-monitoring-coverage-audit.md`). The forcing case for naming this row was the traditional-monitoring observation that inode exhaustion is a distinct failure axis from byte capacity — a canonical "boring obvious" omission in monitoring stacks that conflate "disk is full" with "filesystem is full."

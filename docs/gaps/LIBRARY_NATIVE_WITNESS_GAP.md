@@ -63,7 +63,7 @@ Per `~/.claude/CLAUDE.md` YAGNI doctrine: name the candidate, ratify lazily. Wai
 
 ## Cross-system relationship
 
-This gap is the **construction-side sibling** of NQ's `TESTIMONY_OBSERVABLE_NOT_CONSTRUCTIBLE` gap (`~/git/notquery/docs/gaps/TESTIMONY_OBSERVABLE_NOT_CONSTRUCTIBLE_GAP.md`, filed 2026-05-07). TONC names the wire-boundary problem ("anyone with the shape can mint testimony"); this gap is the production-side answer for one specific class of producer (witness emitters under nq-witness profiles).
+This gap is the **construction-side sibling** of NQ's `TESTIMONY_OBSERVABLE_NOT_CONSTRUCTIBLE` gap (`~/git/nq/docs/gaps/TESTIMONY_OBSERVABLE_NOT_CONSTRUCTIBLE_GAP.md`, filed 2026-05-07). TONC names the wire-boundary problem ("anyone with the shape can mint testimony"); this gap is the production-side answer for one specific class of producer (witness emitters under nq-witness profiles).
 
 Cross-system pattern (preserve the family resemblance — these converged independently):
 
@@ -93,8 +93,8 @@ Falsification grep at filing time:
 | SMART profile | `profiles/smart.md` | Schema definition for `nq.witness.smart.v0`. No library; reference impl is bash. |
 | ZFS reference implementation | `examples/nq-zfs-witness` | Hand-rolled JSON in bash. |
 | SMART reference implementation | `examples/nq-smart-witness` | Hand-rolled JSON in bash. |
-| NQ consumer (ZFS) | `~/git/notquery/crates/nq/src/collect/zfs.rs` | Local shape-trust parsing — receives JSON, validates `schema` and `witness.profile_version` strings, then deserializes into the consumer's own structs. No shared validator with the producer side. |
-| NQ consumer (SMART) | `~/git/notquery/crates/nq/src/collect/smart.rs` | Same shape as ZFS consumer — local parsing, no shared validator. |
+| NQ consumer (ZFS) | `~/git/nq/crates/nq/src/collect/zfs.rs` | Local shape-trust parsing — receives JSON, validates `schema` and `witness.profile_version` strings, then deserializes into the consumer's own structs. No shared validator with the producer side. |
+| NQ consumer (SMART) | `~/git/nq/crates/nq/src/collect/smart.rs` | Same shape as ZFS consumer — local parsing, no shared validator. |
 
 The grep evidence is the cheapest available falsification. If a future audit finds a typed report builder shared between producer and consumer paths, this gap's "library does not yet exist" claim is wrong and the spec should be rewritten or retired.
 
@@ -173,7 +173,7 @@ Sketch only. Implementation requires a forcing case beyond the audit-witness dis
 
 - Untrusted JSON parse path: `UntrustedWitnessReport::from_str(&raw_json)` returns a parsed-but-not-validated value. Distinct type from `WitnessReport`.
 - Validation entry point: `untrusted.validate_against(profile) -> Result<WitnessReport, ValidationError>`. Same validation rules the producer side enforces — single source of truth.
-- Exposed for NQ ingestion: `~/git/notquery/crates/nq/src/collect/zfs.rs` and `smart.rs` parse via `UntrustedWitnessReport`, then call `validate_against`. Local shape-trust parsing goes away.
+- Exposed for NQ ingestion: `~/git/nq/crates/nq/src/collect/zfs.rs` and `smart.rs` parse via `UntrustedWitnessReport`, then call `validate_against`. Local shape-trust parsing goes away.
 
 **Profile crates (separate from core):**
 
@@ -218,7 +218,7 @@ V1 ships Rust only. Python lands when forced.
 V1 implementation involves three coordinated changes across two repos:
 
 1. Extract `nq-witness-mint` crate (this repo, `rust/nq-witness-mint/` or top-level `nq-witness-mint/`).
-2. Update `~/git/notquery/crates/nq/src/collect/{zfs,smart}.rs` to consume the validator. NQ depends on `nq-witness-mint` via path / git URL / published crate (open question).
+2. Update `~/git/nq/crates/nq/src/collect/{zfs,smart}.rs` to consume the validator. NQ depends on `nq-witness-mint` via path / git URL / published crate (open question).
 3. Optionally extract profile crates (`nq-witness-smart`, `nq-witness-zfs`); optionally update bash reference impls (later, not V1).
 
 The "narrow first slice" framing is correct in scope, not in coordination cost. V1 is two-repo work even when narrowly scoped.
@@ -292,7 +292,7 @@ None of these have fired. None should be assumed-imminent. This is preemptive na
 
 ## Provenance
 
-Filed 2026-05-07 as a sidebar to a NotQuery session that closed eight legacy gap-status ratifications and shipped the REGIME_FEATURES V1.6 observability slice. The operator returned from a separate language-audit conversation (`chatty`/ChatGPT) where the cross-language sealing-discipline question had just been worked through (Ada, Erlang, Rust, Python comparison). The library-native witness idea fell out of that audit's recognition that:
+Filed 2026-05-07 as a sidebar to a NQ session that closed eight legacy gap-status ratifications and shipped the REGIME_FEATURES V1.6 observability slice. The operator returned from a separate language-audit conversation (`chatty`/ChatGPT) where the cross-language sealing-discipline question had just been worked through (Ada, Erlang, Rust, Python comparison). The library-native witness idea fell out of that audit's recognition that:
 
 - nq-witness already says the contract is semantic, not transport-specific (SPEC.md);
 - two reference impls now exist (ZFS, SMART) and both hand-roll JSON;
