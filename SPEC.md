@@ -272,6 +272,7 @@ Currently shipped:
 - `profiles/zfs.md` — ZFS pools, vdevs, scrubs, spares
 - `profiles/smart.md` — drive-level SMART health complementing ZFS
 - `profiles/fs_inode.md` — per-mount inode usage with explicit scope declaration
+- `profiles/kea_dhcp.md` — Kea DHCPv4/v6 leases, reservations, subnet/pool scope, DDNS intent
 
 Future (not yet written):
 
