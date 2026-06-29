@@ -288,11 +288,11 @@ None of these have fired. None should be assumed-imminent. This is preemptive na
 5. **`mint.origin` versioning.** When the mint version bumps and the wire format does not change, do reports still need to advertise the new mint version? Lean: yes, but consumers should not branch on it. Open until forced.
 6. **Bash reference impl future.** Stay as bash forever, or eventually rewrite as native exemplars of library-mediated construction? Lean: stay as bash until a native rewrite has its own forcing case.
 7. **Profile crate boundaries.** SMART and ZFS each get their own crate, or do they share `nq-witness-profiles`? Lean: separate crates per profile — different domain expertise, different versioning cadence.
-8. **What does "validation mode" mean operationally?** chatty's earlier sketches had `validation_mode: "strict" | "permissive"` on the mint block. V1 deliberately omits this — strict-by-default is the only shape the library supports. If permissive mode is a real need, it'll appear as a forcing case; for now, no permissive escape hatch in the library.
+8. **What does "validation mode" mean operationally?** ChatGPT's earlier sketches had `validation_mode: "strict" | "permissive"` on the mint block. V1 deliberately omits this — strict-by-default is the only shape the library supports. If permissive mode is a real need, it'll appear as a forcing case; for now, no permissive escape hatch in the library.
 
 ## Provenance
 
-Filed 2026-05-07 as a sidebar to a NQ session that closed eight legacy gap-status ratifications and shipped the REGIME_FEATURES V1.6 observability slice. The operator returned from a separate language-audit conversation (`chatty`/ChatGPT) where the cross-language sealing-discipline question had just been worked through (Ada, Erlang, Rust, Python comparison). The library-native witness idea fell out of that audit's recognition that:
+Filed 2026-05-07 as a sidebar to a NQ session that closed eight legacy gap-status ratifications and shipped the REGIME_FEATURES V1.6 observability slice. The operator returned from a separate language-audit conversation (ChatGPT) where the cross-language sealing-discipline question had just been worked through (Ada, Erlang, Rust, Python comparison). The library-native witness idea fell out of that audit's recognition that:
 
 - nq-witness already says the contract is semantic, not transport-specific (SPEC.md);
 - two reference impls now exist (ZFS, SMART) and both hand-roll JSON;
@@ -302,6 +302,6 @@ Filed 2026-05-07 as a sidebar to a NQ session that closed eight legacy gap-statu
 
 Filing as a sibling preserves the cross-system convergence (AG → NQ TONC → nq-witness library mint) without conflating the wire-boundary and construction-side versions of the discipline.
 
-The keeper, lifted from the chatty conversation:
+The keeper, lifted from the ChatGPT conversation:
 
 > **The mint can make valid construction cheap. Only the consumer validator can make shape admissible.**
