@@ -244,7 +244,7 @@ A memfile-only backend additionally lists under `cannot_testify`: `daemon_state`
 }
 ```
 
-This is the memfile reader NQ already ships (`nq-monitor` `parse_kea_leases`, lab-backed compatibility): real lease identity + lifecycle, everything else honestly demoted. It is the first backend adapter for this profile; the control-socket backend extends coverage, it does not change the contract.
+This is the memfile reader NQ already ships (`nq-monitor` `parse_kea_leases`, lab-backed compatibility): real lease identity + lifecycle, everything else honestly demoted. It is the first backend adapter for this profile; the control-socket backend extends coverage, it does not change the contract. (As of 2026-06-29 the control-socket reader also exists — `nq-monitor` `kea_control` via `lease4-get-all`, producing the same lease shape; cross-backend consistency is tested.)
 
 ## Not required in v0
 
